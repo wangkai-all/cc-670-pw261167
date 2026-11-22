@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>总览 · CDC 变更管线</title>
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<div id="root"></div>
+<script src="app.js"></script>
+<script>
+document.getElementById("root").innerHTML = `
+  ${headerHtml("CDC 变更日志管线")}
+  <main>
+    <div class="card">
+      <h2>三个独立服务</h2>
+      <table>
+        <thead><tr><th>服务</th><th>端口</th><th>职责</th><th>状态</th></tr></thead>
+        <tbody id="svc"></tbody>
+      </table>
+    </div>
+    <div class="card">
+      <h2>端到端演示流程（建议按序操作）</h2>
+      <ol>
+        <li>打开 <b>接收服务</b>，点击「生成项目演示日志」→ 9 个片段进入待投递流（顺序可上下调整、可重投）。</li>
+        <li>打开 <b>配对服务</b>，观察轮询消费：T2 前后像跨批配平；T4 缺前像随 COMMIT 整笔进入异常区。</li>
+        <li>在接收服务对 <code>F01</code> 点「重传（原内容）」→ 不重复执行；点「重传（篡改）」→ 配对页出现 CONTENT_MISMATCH 差异冲突。</li>
+        <li>对 <code>F08</code>（迟到前像）调整顺序/等待轮询 → 配对页「重新核验」→ T4 从异常区恢复为完整。</li>
+        <li>在配对页按「提交序号」逐笔发布：T1→T2→T3→T4；T3 主键 300→301 表现为撤旧加新，order_items 同事务可见；T5 回滚永不发布。</li>
+        <li>打开 <b>目标仓</b> 核对实际行内容、提交记录与审计日志。</li>
+      </ol>
+    </div>
+  </main>`;
+markActiveNav();
+checkHealth("/api/health");
+
+const services = [
+  ["接收服务", "8071", "网页导入片段、调整投递顺序、重复投递", "http://127.0.0.1:8071/api/health", "receiver.html"],
+  ["配对服务", "8072", "按来源事务+语句标识配对、异常区、按提交序号发布", "http://127.0.0.1:8072/api/health", "pairing.html"],
+  ["目标仓服务", "8073", "原子提交、撤旧加新、表/行/审计查询", "http://127.0.0.1:8073/api/health", "target.html"],
+];
+(async () => {
+  const tbody = document.getElementById("svc");
+  for (const [name, port, duty, url, page] of services) {
+    let state = "离线";
+    try {
+      const r = await fetch(url).then((r) => r.json());
+      state = r.ok ? "在线" : "异常";
+    } catch (e) {}
+    tbody.innerHTML += `<tr>
+      <td><a href="${page}" style="color:var(--accent)">${name}</a></td>
+      <td class="mono">${port}</td><td>${duty}</td>
+      <td>${badge(state === "在线" ? "READY" : "EXCEPTION")} ${esc(state)}</td></tr>`;
+  }
+})();
+</script>
+</body>
+</html>

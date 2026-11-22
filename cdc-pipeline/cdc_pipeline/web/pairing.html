@@ -1,0 +1,156 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>配对服务 · 配对与发布</title>
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<div id="root"></div>
+<script src="app.js"></script>
+<script>
+let tab = "pending";
+document.getElementById("root").innerHTML = `
+  ${headerHtml("配对服务：半像配对 / 异常区 / 按提交序号发布")}
+  <main>
+    <div class="card">
+      <div class="row">
+        <button id="btnPoll" class="secondary">立即拉取一轮</button>
+        <button id="btnReverify" class="warn">重新核验异常事务（补齐后）</button>
+        <span class="spacer"></span>
+        <span class="muted">后台每 1 秒自动轮询接收端，消费位置持久化保存</span>
+      </div>
+      <div id="cp" class="muted" style="margin-top:8px"></div>
+    </div>
+
+    <div class="card">
+      <div class="tabs">
+        <button data-tab="pending">待配对记录<span class="pill-count" id="c-pending"></span></button>
+        <button data-tab="ready">完整更新 / 事务<span class="pill-count" id="c-ready"></span></button>
+        <button data-tab="exception">异常区<span class="pill-count" id="c-exception"></span></button>
+        <button data-tab="conflict">被拒绝的冲突<span class="pill-count" id="c-conflict"></span></button>
+        <button data-tab="publish">发布台 & 发布记录</button>
+      </div>
+      <div id="view"></div>
+    </div>
+  </main>`;
+markActiveNav();
+checkHealth("/api/health");
+
+document.querySelectorAll(".tabs button").forEach((b) =>
+  b.addEventListener("click", () => {
+    tab = b.dataset.tab;
+    document.querySelectorAll(".tabs button").forEach((x) => x.classList.toggle("active", x === b));
+    render();
+  })
+);
+document.querySelector('.tabs button[data-tab="pending"]').classList.add("active");
+
+document.getElementById("btnPoll").onclick = async () => {
+  try { toast("拉取完成：" + JSON.stringify((await api("/api/poll", { method: "POST", body: {} })).ingested.length) + " 个投递"); render(); }
+  catch (e) { toast(e.message, false); }
+};
+document.getElementById("btnReverify").onclick = async () => {
+  try { const r = await api("/api/reverify", { method: "POST", body: {} });
+    toast(r.recovered.length ? `恢复事务：${r.recovered.map((x) => x.txn_id).join(", ")}` : "没有可恢复的事务");
+    render();
+  } catch (e) { toast(e.message, false); }
+};
+
+function pairTable(pairs) {
+  if (!pairs.length) return `<p class="muted">无记录</p>`;
+  return `<table><thead><tr>
+    <th>事务</th><th>语句(stmt_id)</th><th>seq</th><th>表</th><th>op</th>
+    <th>状态</th><th>前像</th><th>后像</th></tr></thead><tbody>
+    ${pairs.map((p) => `<tr>
+      <td class="mono">${esc(p.txn_id)}<br><span class="muted">${esc(p.source_id)}</span></td>
+      <td class="mono">${esc(p.stmt_id)}</td>
+      <td>${esc(p.seq)}</td>
+      <td class="mono">${esc(p.table_name)}</td>
+      <td>${badge(p.op)}</td>
+      <td>${badge(p.status)}</td>
+      <td>${p.before_row ? `<details><summary>查看</summary>${pretty(p.before_row)}</details>` : '<span class="muted">缺失</span>'}</td>
+      <td>${p.after_row ? `<details><summary>查看</summary>${pretty(p.after_row)}</details>` : '<span class="muted">缺失</span>'}</td>
+    </tr>`).join("")}
+  </tbody></table>`;
+}
+
+async function render() {
+  const [pending, ready, exceptions, conflicts, txns, plog, health, preview] = await Promise.all([
+    api("/api/pending"), api("/api/ready"), api("/api/exceptions"),
+    api("/api/conflicts"), api("/api/txns"), api("/api/publish-log"),
+    api("/api/health"), api("/api/publish/preview"),
+  ]);
+  document.getElementById("cp").textContent = `当前消费位置 last_attempt_id = ${health.checkpoint}`;
+  document.getElementById("c-pending").textContent = pending.length;
+  document.getElementById("c-ready").textContent = ready.length;
+  document.getElementById("c-exception").textContent = exceptions.length;
+  document.getElementById("c-conflict").textContent = conflicts.length;
+
+  const view = document.getElementById("view");
+  if (tab === "pending") {
+    view.innerHTML = `<p class="muted">配对键 = 来源事务(txn_id) + 语句标识(stmt_id)，绝不只按主键找最近一条；同事务多次更新按 seq 保留真实先后。</p>`
+      + pairTable(pending);
+  } else if (tab === "ready") {
+    view.innerHTML = `
+      <h2 style="font-size:14px">事务总览</h2>
+      <table><thead><tr><th>来源</th><th>事务</th><th>提交序号</th><th>事务状态</th><th>异常原因/目标提交</th></tr></thead>
+      <tbody>${txns.map((t) => `<tr>
+        <td class="mono">${esc(t.source_id)}</td><td class="mono">${esc(t.txn_id)}</td>
+        <td>${t.commit_seq ?? '<span class="muted">无</span>'}</td><td>${badge(t.status)}</td>
+        <td class="muted">${esc(t.exception_reason || (t.published_commit ? "目标提交 #" + t.published_commit : ""))}</td>
+      </tr>`).join("")}</tbody></table>
+      <h2 style="font-size:14px;margin-top:18px">已配平的完整更新（属于完整事务，等待发布）</h2>
+      ${pairTable(ready)}`;
+  } else if (tab === "exception") {
+    view.innerHTML = exceptions.length ? exceptions.map((t) => `
+      <div class="card" style="background:var(--panel2)">
+        <div class="row"><b class="mono">${esc(t.txn_id)}</b> ${badge(t.status)}
+          <span class="muted">commit_seq=${esc(t.commit_seq)}</span></div>
+        <p class="muted">${esc(t.exception_reason)}</p>
+        ${pairTable(t.pairs)}
+        <p class="muted" style="margin-bottom:0">迟到半像到达后点击上方「重新核验」，补齐即可恢复为完整事务。</p>
+      </div>`).join("") : `<p class="muted">异常区为空</p>`;
+  } else if (tab === "conflict") {
+    view.innerHTML = conflicts.length ? `<table><thead><tr>
+      <th>#</th><th>类型</th><th>事务/事件</th><th>说明</th><th>差异明细</th></tr></thead><tbody>
+      ${conflicts.map((c) => `<tr>
+        <td>${c.conflict_id}</td><td>${badge(c.kind === "INCOMPLETE_TXN" ? "EXCEPTION" : "ROLLBACK")} ${esc(c.kind)}</td>
+        <td class="mono">${esc(c.txn_id || "")}<br><span class="muted">${esc(c.event_id || "")}</span><br>
+          <span class="muted">投递#${esc(c.attempt_id)} ${esc(c.fragment_id || "")}</span></td>
+        <td>${esc(c.message)}</td>
+        <td><details><summary>查看</summary>${pretty(c.detail)}</details></td>
+      </tr>`).join("")}</tbody></table>` : `<p class="muted">无被拒绝的冲突</p>`;
+  } else {
+    const next = preview.next;
+    view.innerHTML = `
+      <div class="card" style="background:var(--panel2)">
+        <h2 style="font-size:14px">下一笔待发布（严格按来源 commit_seq；异常未解决会挡住后续序号）</h2>
+        ${next ? `<div class="kv">
+          <b>事务</b><span class="mono">${esc(next.source_id)} / ${esc(next.txn_id)}</span>
+          <b>提交序号</b><span>${esc(next.commit_seq)}</span>
+          <b>将产生变更</b><span>${preview.changes.length} 条（主键迁移已展开为撤旧 D + 加新 I）</span>
+        </div>${pretty(preview.changes)}
+        <button id="btnPublish" style="margin-top:10px">发布该事务到目标仓</button>`
+        : `<p class="muted">没有可发布事务</p>`}
+      </div>
+      <h2 style="font-size:14px">发布记录</h2>
+      <table><thead><tr><th>#</th><th>来源</th><th>事务</th><th>commit_seq</th><th>目标提交</th><th>变更数</th><th>时间</th></tr></thead>
+      <tbody>${plog.length ? plog.map((p) => `<tr>
+        <td>${p.publish_id}</td><td class="mono">${esc(p.source_id)}</td><td class="mono">${esc(p.txn_id)}</td>
+        <td>${esc(p.commit_seq)}</td><td class="mono">#${p.target_commit}</td><td>${p.change_count}</td>
+        <td class="muted">${new Date(p.published_at * 1000).toLocaleString()}</td></tr>`).join("")
+        : `<tr><td colspan="7" class="muted">尚未发布</td></tr>`}</tbody></table>`;
+    const btn = document.getElementById("btnPublish");
+    if (btn) btn.onclick = async () => {
+      try { const r = await api("/api/publish", { method: "POST", body: {} });
+        toast(`已发布 ${r.txn_id} → 目标提交 #${r.target_commit}${r.idempotent ? "（幂等）" : ""}`); render();
+      } catch (e) { toast(e.message + (e.detail ? " " + JSON.stringify(e.detail) : ""), false); }
+    };
+  }
+}
+render();
+setInterval(render, 2000);
+</script>
+</body>
+</html>

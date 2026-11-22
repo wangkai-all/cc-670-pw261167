@@ -1,0 +1,144 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>接收服务 · 日志片段</title>
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<div id="root"></div>
+<script src="app.js"></script>
+<script>
+document.getElementById("root").innerHTML = `
+  ${headerHtml("接收服务：日志片段导入 / 顺序 / 重投")}
+  <main>
+    <div class="card">
+      <h2>导入日志片段（JSON 数组或 NDJSON，每行一个事件）</h2>
+      <div class="row" style="margin-bottom:8px">
+        <input type="text" id="fid" placeholder="片段编号（可空，自动生成）">
+        <input type="text" id="note" placeholder="备注，如：T2 前像批次">
+        <button id="btnImport">导入片段</button>
+        <button class="secondary" id="btnDemo">生成项目演示日志（9 个片段）</button>
+        <button class="secondary" id="btnRefresh">刷新</button>
+      </div>
+      <textarea id="content" placeholder='[{"event_id":"E1","source_id":"SRC1","txn_id":"T1","stmt_id":"S1",...}]'></textarea>
+    </div>
+
+    <div class="card">
+      <h2>投递流（按投递顺序被配对服务消费；已消费的投递不能再移动）</h2>
+      <table>
+        <thead><tr>
+          <th>顺序</th><th>片段</th><th>来源</th><th>事件数</th><th>投递次数</th>
+          <th>消费状态</th><th>操作</th><th>备注</th>
+        </tr></thead>
+        <tbody id="frags"></tbody>
+      </table>
+    </div>
+
+    <div class="card" id="detailCard" style="display:none">
+      <h2>片段事件明细 <span id="detailTitle" class="muted"></span></h2>
+      <div id="detail"></div>
+    </div>
+  </main>`;
+markActiveNav();
+checkHealth("/api/health");
+
+async function load() {
+  const frags = await api("/api/fragments");
+  const tbody = document.getElementById("frags");
+  if (!frags.length) {
+    tbody.innerHTML = `<tr><td colspan="8" class="muted">暂无片段，点击上方「生成项目演示日志」快速开始</td></tr>`;
+    return;
+  }
+  // 以最早投递排序，展示每个片段的全部投递副本
+  const order = [];
+  frags.forEach((f) => f.deliveries.forEach((d) => order.push({ f, d })));
+  order.sort((a, b) => a.d.sort_key - b.d.sort_key || a.d.attempt_id - b.d.attempt_id);
+
+  const fragMap = new Map(frags.map((f) => [f.fragment_id, f]));
+  tbody.innerHTML = frags.map((f) => {
+    const consumed = f.consumed_count;
+    const total = f.delivery_count;
+    const firstDelivery = f.deliveries[0];
+    const canMove = firstDelivery && !firstDelivery.consumed;
+    return `<tr>
+      <td class="mono">${firstDelivery ? firstDelivery.sort_key : "-"}</td>
+      <td><a href="#" onclick="showDetail('${esc(f.fragment_id)}');return false" style="color:var(--accent)">
+        ${esc(f.fragment_id)}</a></td>
+      <td class="mono">${esc(f.source_id)}</td>
+      <td>${f.event_count}</td>
+      <td>${total} <span class="muted">(${consumed}/${total} 已消费)</span></td>
+      <td>${consumed === 0 ? badge("WAITING") : consumed >= total ? badge("READY") : badge("INFO")}
+          ${consumed >= total ? "已消费" : consumed > 0 ? "部分消费" : "待消费"}</td>
+      <td class="row" style="gap:6px">
+        <button class="secondary" ${canMove ? "" : "disabled"}
+          onclick="reorder(${firstDelivery.attempt_id},'up')">↑ 前移</button>
+        <button class="secondary" ${canMove ? "" : "disabled"}
+          onclick="reorder(${firstDelivery.attempt_id},'down')">↓ 后移</button>
+        <button class="secondary" onclick="redeliver('${esc(f.fragment_id)}',false)">重传（原内容）</button>
+        <button class="warn" onclick="redeliver('${esc(f.fragment_id)}',true)">重传（篡改内容）</button>
+      </td>
+      <td class="muted">${esc(f.note || "")}</td>
+    </tr>`;
+  }).join("");
+}
+
+async function showDetail(fid) {
+  const f = await api(`/api/fragments/${encodeURIComponent(fid)}`);
+  document.getElementById("detailCard").style.display = "";
+  document.getElementById("detailTitle").textContent = fid;
+  document.getElementById("detail").innerHTML = `
+    <div class="kv">
+      <b>投递副本</b><span>${f.deliveries.map((d) =>
+        `#${d.attempt_id} 顺序${d.sort_key} ${d.tampered ? "【篡改】" : ""} ${d.consumed ? "已消费" : "待消费"}`
+      ).join("<br>")}</span>
+      <b>内容指纹</b><span class="mono">${esc(f.content_hash.slice(0, 16))}…</span>
+    </div>
+    ${pretty(f.events)}`;
+}
+
+async function reorder(attemptId, dir) {
+  try {
+    await api(`/api/deliveries/${attemptId}/reorder`, { method: "POST", body: { direction: dir } });
+    toast(`投递 #${attemptId} 已${dir === "up" ? "前移" : "后移"}`);
+    load();
+  } catch (e) { toast(e.message, false); }
+}
+
+async function redeliver(fid, tampered) {
+  try {
+    const r = await api(`/api/fragments/${encodeURIComponent(fid)}/redeliver`,
+      { method: "POST", body: { tampered } });
+    toast(`已生成重投递 #${r.attempt_id}${tampered ? "（内容已篡改，配对服务将报差异）" : "（同内容，应幂等跳过）"}`);
+    load();
+  } catch (e) { toast(e.message, false); }
+}
+
+document.getElementById("btnImport").onclick = async () => {
+  try {
+    const r = await api("/api/fragments", {
+      method: "POST",
+      body: {
+        content: document.getElementById("content").value,
+        fragment_id: document.getElementById("fid").value || null,
+        note: document.getElementById("note").value || null,
+      },
+    });
+    toast(`片段 ${r.fragment_id} 导入成功，已进入投递流`);
+    load();
+  } catch (e) { toast(e.message, false); }
+};
+
+document.getElementById("btnDemo").onclick = async () => {
+  try {
+    const r = await api("/api/demo/load", { method: "POST", body: {} });
+    toast(`演示日志就绪：新导入 ${r.imported.length} 个片段，文件在 data/generated_logs/`);
+    load();
+  } catch (e) { toast(e.message, false); }
+};
+document.getElementById("btnRefresh").onclick = () => load();
+load();
+setInterval(load, 3000);
+</script>
+</body>
+</html>

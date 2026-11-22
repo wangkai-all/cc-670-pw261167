@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>目标仓 · 内容核对</title>
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<div id="root"></div>
+<script src="app.js"></script>
+<script>
+document.getElementById("root").innerHTML = `
+  ${headerHtml("目标分析仓：实际内容核对")}
+  <main>
+    <div class="card">
+      <h2>仓内表与行数</h2>
+      <table><thead><tr><th>表</th><th>行数</th><th></th></tr></thead>
+      <tbody id="tables"></tbody></table>
+    </div>
+    <div class="card">
+      <h2>全部当前行（主键迁移后旧键应消失、新键应存在）</h2>
+      <table><thead><tr><th>表</th><th>主键值</th><th>行数据</th><th>最后写入提交</th></tr></thead>
+      <tbody id="rows"></tbody></table>
+    </div>
+    <div class="grid2">
+      <div class="card">
+        <h2>提交记录（按来源事务幂等）</h2>
+        <table><thead><tr><th>#</th><th>来源事务</th><th>seq</th><th>变更数</th><th>状态</th></tr></thead>
+        <tbody id="commits"></tbody></table>
+      </div>
+      <div class="card">
+        <h2>审计日志（撤旧加新留痕）</h2>
+        <table><thead><tr><th>提交</th><th>表</th><th>op</th><th>键</th></tr></thead>
+        <tbody id="audit"></tbody></table>
+      </div>
+    </div>
+  </main>`;
+markActiveNav();
+checkHealth("/api/health");
+
+async function load() {
+  const [tables, rows, commits, audit] = await Promise.all([
+    api("/api/tables"), api("/api/rows"), api("/api/commits"), api("/api/audit"),
+  ]);
+  document.getElementById("tables").innerHTML = tables.length
+    ? tables.map((t) => `<tr><td class="mono">${esc(t.table_name)}</td><td>${t.row_count}</td>
+        <td><a href="#rows" style="color:var(--accent)" onclick="document.getElementById('rows').scrollIntoView()">查看行</a></td></tr>`).join("")
+    : `<tr><td colspan="3" class="muted">空仓</td></tr>`;
+  document.getElementById("rows").innerHTML = rows.length
+    ? rows.map((r) => `<tr>
+        <td class="mono">${esc(r.table)}</td>
+        <td class="mono">${esc(JSON.stringify(r.key_values))}</td>
+        <td><details><summary>${esc(Object.keys(r.data).length)} 个字段</summary>${pretty(r.data)}</details></td>
+        <td class="mono">#${r.commit_id}</td></tr>`).join("")
+    : `<tr><td colspan="4" class="muted">暂无数据</td></tr>`;
+  document.getElementById("commits").innerHTML = commits.length
+    ? commits.map((c) => `<tr>
+        <td class="mono">#${c.commit_id}</td>
+        <td class="mono">${esc(c.source_id)} / ${esc(c.txn_id)}</td>
+        <td>${esc(c.commit_seq)}</td><td>${c.change_count}</td><td>${badge(c.status)}</td></tr>`).join("")
+    : `<tr><td colspan="5" class="muted">暂无提交</td></tr>`;
+  document.getElementById("audit").innerHTML = audit.length
+    ? audit.map((a) => `<tr>
+        <td class="mono">#${a.commit_id}</td><td class="mono">${esc(a.table_name)}</td>
+        <td>${badge(a.op === "I" ? "READY" : a.op === "D" ? "EXCEPTION" : "INFO")} ${esc(a.op)}</td>
+        <td class="mono">${esc(JSON.stringify(a.key_values))}</td></tr>`).join("")
+    : `<tr><td colspan="4" class="muted">暂无审计</td></tr>`;
+}
+load();
+setInterval(load, 2500);
+</script>
+</body>
+</html>
